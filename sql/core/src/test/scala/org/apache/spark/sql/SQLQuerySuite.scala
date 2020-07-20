@@ -3495,6 +3495,71 @@ class SQLQuerySuite extends QueryTest with SharedSparkSession with AdaptiveSpark
     assert(df4.schema.head.name === "randn(1)")
     checkIfSeedExistsInExplain(df2)
   }
+
+  test("SPARK-31761: test byte, short, integer overflow for (Divide) integral type") {
+    checkAnswer(sql("Select -2147483648 DIV -1"), Seq(Row(Integer.MIN_VALUE.toLong * -1)))
+    checkAnswer(sql("select CAST(-128 as Byte) DIV CAST (-1 as Byte)"),
+      Seq(Row(Byte.MinValue.toLong * -1)))
+    checkAnswer(sql("select CAST(-32768 as short) DIV CAST (-1 as short)"),
+      Seq(Row(Short.MinValue.toLong * -1)))
+  }
+
+  test("normalize special floating numbers in subquery") {
+    withTempView("v1", "v2", "v3") {
+      Seq(-0.0).toDF("d").createTempView("v1")
+      Seq(0.0).toDF("d").createTempView("v2")
+      spark.range(2).createTempView("v3")
+
+      // non-correlated subquery
+      checkAnswer(sql("SELECT (SELECT v1.d FROM v1 JOIN v2 ON v1.d = v2.d)"), Row(-0.0))
+      // correlated subquery
+      checkAnswer(
+        sql(
+          """
+            |SELECT id FROM v3 WHERE EXISTS
+            |  (SELECT v1.d FROM v1 JOIN v2 ON v1.d = v2.d WHERE id > 0)
+            |""".stripMargin), Row(1))
+    }
+  }
+
+  test("SPARK-31875: remove hints from plan when spark.sql.optimizer.disableHints = true") {
+    withSQLConf(SQLConf.DISABLE_HINTS.key -> "true") {
+      withTempView("t1", "t2") {
+        Seq[Integer](1, 2).toDF("c1").createOrReplaceTempView("t1")
+        Seq[Integer](1, 2).toDF("c1").createOrReplaceTempView("t2")
+        val repartitionHints = Seq(
+          "COALESCE(2)",
+          "REPARTITION(c1)",
+          "REPARTITION(c1, 2)",
+          "REPARTITION_BY_RANGE(c1, 2)",
+          "REPARTITION_BY_RANGE(c1)"
+        )
+        val joinHints = Seq(
+          "BROADCASTJOIN (t1)",
+          "MAPJOIN(t1)",
+          "SHUFFLE_MERGE(t1)",
+          "MERGEJOIN(t1)",
+          "SHUFFLE_REPLICATE_NL(t1)"
+        )
+
+        repartitionHints.foreach { hintName =>
+          val sqlText = s"SELECT /*+ $hintName */ * FROM t1"
+          val sqlTextWithoutHint = "SELECT * FROM t1"
+          val expectedPlan = sql(sqlTextWithoutHint)
+          val actualPlan = sql(sqlText)
+          comparePlans(actualPlan.queryExecution.analyzed, expectedPlan.queryExecution.analyzed)
+        }
+
+        joinHints.foreach { hintName =>
+          val sqlText = s"SELECT /*+ $hintName */ * FROM t1 INNER JOIN t2 ON t1.c1 = t2.c1"
+          val sqlTextWithoutHint = "SELECT * FROM t1 INNER JOIN t2 ON t1.c1 = t2.c1"
+          val expectedPlan = sql(sqlTextWithoutHint)
+          val actualPlan = sql(sqlText)
+          comparePlans(actualPlan.queryExecution.analyzed, expectedPlan.queryExecution.analyzed)
+        }
+      }
+    }
+  }
 }
 
 case class Foo(bar: Option[String])
