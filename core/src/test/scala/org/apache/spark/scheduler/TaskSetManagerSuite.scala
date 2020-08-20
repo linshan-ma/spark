@@ -31,7 +31,7 @@ import org.scalatest.Assertions._
 import org.scalatest.PrivateMethodTester
 import org.scalatest.concurrent.Eventually
 
-import org.apache.spark._
+import org.apache.spark.{FakeSchedulerBackend => _, _}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
 import org.apache.spark.internal.config.Tests.SKIP_VALIDATE_CORES_TESTING
@@ -748,6 +748,14 @@ class TaskSetManagerSuite
       sc.makeRDD(0 until 10, 10).map(genBytes(1 << 20)).collect()
     }
     assert(thrown2.getMessage().contains("bigger than spark.driver.maxResultSize"))
+  }
+
+  test("SPARK-32470: do not check total size of intermediate stages") {
+    val conf = new SparkConf().set(config.MAX_RESULT_SIZE.key, "20k")
+    sc = new SparkContext("local", "test", conf)
+    // final result is below limit.
+    val r = sc.makeRDD(0 until 2000, 2000).distinct(10).filter(_ == 0).collect()
+    assert(1 === r.size)
   }
 
   test("[SPARK-13931] taskSetManager should not send Resubmitted tasks after being a zombie") {

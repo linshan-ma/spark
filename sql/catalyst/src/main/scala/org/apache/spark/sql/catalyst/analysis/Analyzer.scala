@@ -200,6 +200,11 @@ class Analyzer(
   val postHocResolutionRules: Seq[Rule[LogicalPlan]] = Nil
 
   lazy val batches: Seq[Batch] = Seq(
+    Batch("Substitution", fixedPoint,
+      CTESubstitution,
+      WindowsSubstitution,
+      EliminateUnions,
+      new SubstituteUnresolvedOrdinals(conf)),
     Batch("Disable Hints", Once,
       new ResolveHints.DisableHints(conf)),
     Batch("Hints", fixedPoint,
@@ -207,11 +212,6 @@ class Analyzer(
       new ResolveHints.ResolveCoalesceHints(conf)),
     Batch("Simple Sanity Check", Once,
       LookupFunctions),
-    Batch("Substitution", fixedPoint,
-      CTESubstitution,
-      WindowsSubstitution,
-      EliminateUnions,
-      new SubstituteUnresolvedOrdinals(conf)),
     Batch("Resolution", fixedPoint,
       ResolveTableValuedFunctions ::
       ResolveNamespace(catalogManager) ::
@@ -249,6 +249,7 @@ class Analyzer(
       ResolveTimeZone(conf) ::
       ResolveRandomSeed ::
       ResolveBinaryArithmetic ::
+      ResolveUnion ::
       TypeCoercion.typeCoercionRules(conf) ++
       extendedResolutionRules : _*),
     Batch("Post-Hoc Resolution", Once, postHocResolutionRules: _*),
@@ -1192,10 +1193,23 @@ class Analyzer(
             if findAliases(projectList).intersect(conflictingAttributes).nonEmpty =>
           Seq((oldVersion, oldVersion.copy(projectList = newAliases(projectList))))
 
+        // We don't need to search child plan recursively if the projectList of a Project
+        // is only composed of Alias and doesn't contain any conflicting attributes.
+        // Because, even if the child plan has some conflicting attributes, the attributes
+        // will be aliased to non-conflicting attributes by the Project at the end.
+        case _ @ Project(projectList, _)
+          if findAliases(projectList).size == projectList.size =>
+          Nil
+
         case oldVersion @ Aggregate(_, aggregateExpressions, _)
             if findAliases(aggregateExpressions).intersect(conflictingAttributes).nonEmpty =>
           Seq((oldVersion, oldVersion.copy(
             aggregateExpressions = newAliases(aggregateExpressions))))
+
+        // We don't search the child plan recursively for the same reason as the above Project.
+        case _ @ Aggregate(_, aggregateExpressions, _)
+          if findAliases(aggregateExpressions).size == aggregateExpressions.size =>
+          Nil
 
         case oldVersion @ FlatMapGroupsInPandas(_, _, output, _)
             if oldVersion.outputSet.intersect(conflictingAttributes).nonEmpty =>
@@ -1237,20 +1251,50 @@ class Analyzer(
       if (conflictPlans.isEmpty) {
         right
       } else {
-        val attributeRewrites = AttributeMap(conflictPlans.flatMap {
-          case (oldRelation, newRelation) => oldRelation.output.zip(newRelation.output)})
-        val conflictPlanMap = conflictPlans.toMap
-        // transformDown so that we can replace all the old Relations in one turn due to
-        // the reason that `conflictPlans` are also collected in pre-order.
-        right transformDown {
-          case r => conflictPlanMap.getOrElse(r, r)
-        } transformUp {
-          case other => other transformExpressions {
+        rewritePlan(right, conflictPlans.toMap)._1
+      }
+    }
+
+    private def rewritePlan(plan: LogicalPlan, conflictPlanMap: Map[LogicalPlan, LogicalPlan])
+      : (LogicalPlan, Seq[(Attribute, Attribute)]) = {
+      if (conflictPlanMap.contains(plan)) {
+        // If the plan is the one that conflict the with left one, we'd
+        // just replace it with the new plan and collect the rewrite
+        // attributes for the parent node.
+        val newRelation = conflictPlanMap(plan)
+        newRelation -> plan.output.zip(newRelation.output)
+      } else {
+        val attrMapping = new mutable.ArrayBuffer[(Attribute, Attribute)]()
+        val newPlan = plan.mapChildren { child =>
+          // If not, we'd rewrite child plan recursively until we find the
+          // conflict node or reach the leaf node.
+          val (newChild, childAttrMapping) = rewritePlan(child, conflictPlanMap)
+          attrMapping ++= childAttrMapping.filter { case (oldAttr, _) =>
+            // `attrMapping` is not only used to replace the attributes of the current `plan`,
+            // but also to be propagated to the parent plans of the current `plan`. Therefore,
+            // the `oldAttr` must be part of either `plan.references` (so that it can be used to
+            // replace attributes of the current `plan`) or `plan.outputSet` (so that it can be
+            // used by those parent plans).
+            (plan.outputSet ++ plan.references).contains(oldAttr)
+          }
+          newChild
+        }
+
+        if (attrMapping.isEmpty) {
+          newPlan -> attrMapping.toSeq
+        } else {
+          assert(!attrMapping.groupBy(_._1.exprId)
+            .exists(_._2.map(_._2.exprId).distinct.length > 1),
+            "Found duplicate rewrite attributes")
+          val attributeRewrites = AttributeMap(attrMapping.toSeq)
+          // Using attrMapping from the children plans to rewrite their parent node.
+          // Note that we shouldn't rewrite a node using attrMapping from its sibling nodes.
+          newPlan.transformExpressions {
             case a: Attribute =>
               dedupAttr(a, attributeRewrites)
             case s: SubqueryExpression =>
               s.withNewPlan(dedupOuterReferencesInSubquery(s.plan, attributeRewrites))
-          }
+          } -> attrMapping.toSeq
         }
       }
     }
@@ -1387,10 +1431,11 @@ class Analyzer(
         i.copy(right = dedupRight(left, right))
       case e @ Except(left, right, _) if !e.duplicateResolved =>
         e.copy(right = dedupRight(left, right))
-      case u @ Union(children) if !u.duplicateResolved =>
+      // Only after we finish by-name resolution for Union
+      case u: Union if !u.byName && !u.duplicateResolved =>
         // Use projection-based de-duplication for Union to avoid breaking the checkpoint sharing
         // feature in streaming.
-        val newChildren = children.foldRight(Seq.empty[LogicalPlan]) { (head, tail) =>
+        val newChildren = u.children.foldRight(Seq.empty[LogicalPlan]) { (head, tail) =>
           head +: tail.map {
             case child if head.outputSet.intersect(child.outputSet).isEmpty =>
               child
@@ -1886,11 +1931,17 @@ class Analyzer(
   }
 
   /**
+   * Replaces [[UnresolvedFunc]]s with concrete [[LogicalPlan]]s.
    * Replaces [[UnresolvedFunction]]s with concrete [[Expression]]s.
    */
   object ResolveFunctions extends Rule[LogicalPlan] {
     val trimWarningEnabled = new AtomicBoolean(true)
     def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUp {
+      // Resolve functions with concrete relations from v2 catalog.
+      case UnresolvedFunc(multipartIdent) =>
+        val funcIdent = parseSessionCatalogFunctionIdentifier(multipartIdent)
+        ResolvedFunc(Identifier.of(funcIdent.database.toArray, funcIdent.funcName))
+
       case q: LogicalPlan =>
         q transformExpressions {
           case u if !u.childrenResolved => u // Skip until children are resolved.
@@ -1922,15 +1973,9 @@ class Analyzer(
                   }
                 // We get an aggregate function, we need to wrap it in an AggregateExpression.
                 case agg: AggregateFunction =>
-                  // TODO: SPARK-30276 Support Filter expression allows simultaneous use of DISTINCT
-                  if (filter.isDefined) {
-                    if (isDistinct) {
-                      failAnalysis("DISTINCT and FILTER cannot be used in aggregate functions " +
-                        "at the same time")
-                    } else if (!filter.get.deterministic) {
-                      failAnalysis("FILTER expression is non-deterministic, " +
-                        "it cannot be used in aggregate functions")
-                    }
+                  if (filter.isDefined && !filter.get.deterministic) {
+                    failAnalysis("FILTER expression is non-deterministic, " +
+                      "it cannot be used in aggregate functions")
                   }
                   AggregateExpression(agg, Complete, isDistinct, filter)
                 // This function is not an aggregate function, just return the resolved one.
@@ -2507,6 +2552,8 @@ class Analyzer(
    *    [[Window]] operator and inserts it into the plan tree.
    */
   object ExtractWindowExpressions extends Rule[LogicalPlan] {
+    type Spec = (Seq[Expression], Seq[SortOrder], WindowFunctionType)
+
     private def hasWindowFunction(exprs: Seq[Expression]): Boolean =
       exprs.exists(hasWindowFunction)
 
@@ -2651,8 +2698,11 @@ class Analyzer(
         }.asInstanceOf[NamedExpression]
       }
 
+      // SPARK-32616: Use a linked hash map to maintains the insertion order of the Window
+      // operators, so the query with multiple Window operators can have the determined plan.
+      val groupedWindowExpressions = mutable.LinkedHashMap.empty[Spec, ArrayBuffer[NamedExpression]]
       // Second, we group extractedWindowExprBuffer based on their Partition and Order Specs.
-      val groupedWindowExpressions = extractedWindowExprBuffer.groupBy { expr =>
+      extractedWindowExprBuffer.foreach { expr =>
         val distinctWindowSpec = expr.collect {
           case window: WindowExpression => window.windowSpec
         }.distinct
@@ -2668,9 +2718,12 @@ class Analyzer(
             s"Please file a bug report with this error message, stack trace, and the query.")
         } else {
           val spec = distinctWindowSpec.head
-          (spec.partitionSpec, spec.orderSpec, WindowFunctionType.functionType(expr))
+          val specKey = (spec.partitionSpec, spec.orderSpec, WindowFunctionType.functionType(expr))
+          val windowExprs = groupedWindowExpressions
+            .getOrElseUpdate(specKey, new ArrayBuffer[NamedExpression])
+          windowExprs += expr
         }
-      }.toSeq
+      }
 
       // Third, we aggregate them by adding each Window operator for each Window Spec and then
       // setting this to the child of the next Window operator.
@@ -3398,7 +3451,7 @@ object EliminateSubqueryAliases extends Rule[LogicalPlan] {
  */
 object EliminateUnions extends Rule[LogicalPlan] {
   def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
-    case Union(children) if children.size == 1 => children.head
+    case u: Union if u.children.size == 1 => u.children.head
   }
 }
 

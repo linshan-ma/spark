@@ -20,6 +20,7 @@ package org.apache.spark.sql.catalyst.optimizer
 import scala.collection.mutable
 
 import org.apache.spark.sql.AnalysisException
+import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.analysis._
 import org.apache.spark.sql.catalyst.catalog.{InMemoryCatalog, SessionCatalog}
 import org.apache.spark.sql.catalyst.expressions._
@@ -51,8 +52,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
   override protected val excludedOnceBatches: Set[String] =
     Set(
       "PartitionPruning",
-      "Extract Python UDFs",
-      "Push CNF predicate through join")
+      "Extract Python UDFs")
 
   protected def fixedPoint =
     FixedPoint(
@@ -93,6 +93,7 @@ abstract class Optimizer(catalogManager: CatalogManager)
         FoldablePropagation,
         OptimizeIn,
         ConstantFolding,
+        EliminateAggregateFilter,
         ReorderAssociativeOperator,
         LikeSimplification,
         BooleanSimplification,
@@ -123,8 +124,9 @@ abstract class Optimizer(catalogManager: CatalogManager)
         rulesWithoutInferFiltersFromConstraints: _*) ::
       // Set strategy to Once to avoid pushing filter every time because we do not change the
       // join condition.
-      Batch("Push CNF predicate through join", Once,
-        PushCNFPredicateThroughJoin) :: Nil
+      Batch("Push extra predicate through join", fixedPoint,
+        PushExtraPredicateThroughJoin,
+        PushDownPredicates) :: Nil
     }
 
     val batches = (Batch("Eliminate Distinct", Once, EliminateDistinct) ::
@@ -340,6 +342,27 @@ object EliminateDistinct extends Rule[LogicalPlan] {
 }
 
 /**
+ * Remove useless FILTER clause for aggregate expressions.
+ * This rule should be applied before RewriteDistinctAggregates.
+ */
+object EliminateAggregateFilter extends Rule[LogicalPlan] {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan transformExpressions  {
+    case ae @ AggregateExpression(_, _, _, Some(Literal.TrueLiteral), _) =>
+      ae.copy(filter = None)
+    case AggregateExpression(af: DeclarativeAggregate, _, _, Some(Literal.FalseLiteral), _) =>
+      val initialProject = SafeProjection.create(af.initialValues)
+      val evalProject = SafeProjection.create(af.evaluateExpression :: Nil, af.aggBufferAttributes)
+      val initialBuffer = initialProject(EmptyRow)
+      val internalRow = evalProject(initialBuffer)
+      Literal.create(internalRow.get(0, af.dataType), af.dataType)
+    case AggregateExpression(af: ImperativeAggregate, _, _, Some(Literal.FalseLiteral), _) =>
+      val buffer = new SpecificInternalRow(af.aggBufferAttributes.map(_.dataType))
+      af.initialize(buffer)
+      Literal.create(af.eval(buffer), af.dataType)
+  }
+}
+
+/**
  * An optimizer used in test code.
  *
  * To ensure extendability, we leave the standard rules in the abstract optimizer rules, while
@@ -497,8 +520,8 @@ object LimitPushDown extends Rule[LogicalPlan] {
     // Note: right now Union means UNION ALL, which does not de-duplicate rows, so it is safe to
     // pushdown Limit through it. Once we add UNION DISTINCT, however, we will not be able to
     // pushdown Limit.
-    case LocalLimit(exp, Union(children)) =>
-      LocalLimit(exp, Union(children.map(maybePushLocalLimit(exp, _))))
+    case LocalLimit(exp, u: Union) =>
+      LocalLimit(exp, u.copy(children = u.children.map(maybePushLocalLimit(exp, _))))
     // Add extra limits below OUTER JOIN. For LEFT OUTER and RIGHT OUTER JOIN we push limits to
     // the left and right sides, respectively. It's not safe to push limits below FULL OUTER
     // JOIN in the general case without a more invasive rewrite.
@@ -556,15 +579,15 @@ object PushProjectionThroughUnion extends Rule[LogicalPlan] with PredicateHelper
   def apply(plan: LogicalPlan): LogicalPlan = plan transform {
 
     // Push down deterministic projection through UNION ALL
-    case p @ Project(projectList, Union(children)) =>
-      assert(children.nonEmpty)
+    case p @ Project(projectList, u: Union) =>
+      assert(u.children.nonEmpty)
       if (projectList.forall(_.deterministic)) {
-        val newFirstChild = Project(projectList, children.head)
-        val newOtherChildren = children.tail.map { child =>
-          val rewrites = buildRewrites(children.head, child)
+        val newFirstChild = Project(projectList, u.children.head)
+        val newOtherChildren = u.children.tail.map { child =>
+          val rewrites = buildRewrites(u.children.head, child)
           Project(projectList.map(pushToRight(_, rewrites)), child)
         }
-        Union(newFirstChild +: newOtherChildren)
+        u.copy(children = newFirstChild +: newOtherChildren)
       } else {
         p
       }
@@ -928,19 +951,28 @@ object CombineUnions extends Rule[LogicalPlan] {
   }
 
   private def flattenUnion(union: Union, flattenDistinct: Boolean): Union = {
+    val topByName = union.byName
+    val topAllowMissingCol = union.allowMissingCol
+
     val stack = mutable.Stack[LogicalPlan](union)
     val flattened = mutable.ArrayBuffer.empty[LogicalPlan]
+    // Note that we should only flatten the unions with same byName and allowMissingCol.
+    // Although we do `UnionCoercion` at analysis phase, we manually run `CombineUnions`
+    // in some places like `Dataset.union`. Flattening unions with different resolution
+    // rules (by position and by name) could cause incorrect results.
     while (stack.nonEmpty) {
       stack.pop() match {
-        case Distinct(Union(children)) if flattenDistinct =>
+        case Distinct(Union(children, byName, allowMissingCol))
+            if flattenDistinct && byName == topByName && allowMissingCol == topAllowMissingCol =>
           stack.pushAll(children.reverse)
-        case Union(children) =>
+        case Union(children, byName, allowMissingCol)
+            if byName == topByName && allowMissingCol == topAllowMissingCol =>
           stack.pushAll(children.reverse)
         case child =>
           flattened += child
       }
     }
-    Union(flattened.toSeq)
+    union.copy(children = flattened.toSeq)
   }
 }
 
