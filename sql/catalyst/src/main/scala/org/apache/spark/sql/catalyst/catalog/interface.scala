@@ -28,7 +28,7 @@ import org.apache.commons.lang3.StringUtils
 
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.AnalysisException
-import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow, TableIdentifier}
+import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow, SQLConfHelper, TableIdentifier}
 import org.apache.spark.sql.catalyst.analysis.MultiInstanceRelation
 import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeMap, AttributeReference, Cast, ExprId, Literal}
 import org.apache.spark.sql.catalyst.plans.logical._
@@ -177,8 +177,7 @@ case class CatalogTablePartition(
 case class BucketSpec(
     numBuckets: Int,
     bucketColumnNames: Seq[String],
-    sortColumnNames: Seq[String]) {
-  def conf: SQLConf = SQLConf.get
+    sortColumnNames: Seq[String]) extends SQLConfHelper {
 
   if (numBuckets <= 0 || numBuckets > conf.bucketingMaxBuckets) {
     throw new AnalysisException(
@@ -643,7 +642,8 @@ object CatalogTypes {
  */
 case class UnresolvedCatalogRelation(
     tableMeta: CatalogTable,
-    options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty()) extends LeafNode {
+    options: CaseInsensitiveStringMap = CaseInsensitiveStringMap.empty(),
+    override val isStreaming: Boolean = false) extends LeafNode {
   assert(tableMeta.identifier.database.isDefined)
   override lazy val resolved: Boolean = false
   override def output: Seq[Attribute] = Nil
